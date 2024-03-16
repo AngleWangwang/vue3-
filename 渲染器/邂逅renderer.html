@@ -11,7 +11,6 @@
       let activeEffect;
       const effectStack = [];
       let effect = function (fn, options = {}) {
-        // debugger;
         const effectFn = () => {
           activeEffect = effectFn;
           cleanup(effectFn);
