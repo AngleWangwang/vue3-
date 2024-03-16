@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <body>
+    <script>
+      let activeEffect;
+      const effectStack = [];
+      let effect = function (fn, options = {}) {
+        // debugger
+        const effectFn = () => {
+          activeEffect = effectFn;
+          cleanup(effectFn);
+
+          // 在调用副作用函数之前将当前副作用函数压入栈中
+          effectStack.push(effectFn);
+          const res = fn();
+          effectStack.pop();
+          activeEffect = effectStack[effectStack.length - 1];
+          return res;
+        };
+        effectFn.options = options;
+        effectFn.deps = [];
+        if (!options.lazy) {
+          effectFn();
+        }
+        return effectFn;
+      };
+      let bucket = new WeakMap();
+      let data = {
+        foo: 1,
+        bar: 1,
+      };
+      const ITERATE_KEY = Symbol();
+      const TriggerType = {
+        SET: "SET",
+        ADD: "ADD",
+        DELETE: "DELETE",
+      };
+      let obj = new Proxy(data, {
+        // 访问属性 响应式拦截使用get，set
+        get(target, key) {
+          track(target, key);
+          return target[key];
+        },
+        set(target, key, newVal, receiver) {
+          // 先保存旧值
+          const oldVal = target[key];
+          // 先获取当前操作的key是否是新增的key
+          const type = Object.prototype.hasOwnProperty.call(target, key)
+            ? TriggerType["SET"]
+            : TriggerType["ADD"];
+          const res = Reflect.set(target, key, newVal, receiver);
+          // 比较新值与旧值，只有当它们不全等，并且不都是 NaN 的时候才触发响应
+          if (oldVal !== newVal && (oldVal === oldVal || newVal === newVal)) {
+            trigger(target, key, type);
+          }
+          // target[key] = value;
+
+          return res;
+        },
+        // in关键字访问使用has拦截
+        has(target, key) {
+          track(target, key);
+          return Reflect.has(target, key);
+        },
+        // for...in循环遍历对象
+        ownKeys(target) {
+          // 将副作用函数与 ITERATE_KEY 关联
+          track(target, ITERATE_KEY);
+          return Reflect.ownKeys(target);
+        },
+        deleteProperty(target, key) {
+          // 检查被操作的属性是否是对象自己的属性
+          const hasKey = Object.prototype.hasOwnProperty.call(target, key);
+          // 使用Reflect.deleteProperty完成删除
+          const res = Reflect.defineProperty(target, key);
+          // 只有当被删除的属性是对象自己的属性并且成功删除时，才触发更新
+          if (res && hasKey) {
+            trigger(target, key, TriggerType["DELETE"]);
+          }
+        },
+      });
+
+      function track(target, key) {
+        if (!activeEffect) return;
+        let depsMap = bucket.get(target);
+        if (!depsMap) {
+          bucket.set(target, (depsMap = new Map()));
+        }
+        let deps = depsMap.get(key);
+        if (!deps) {
+          depsMap.set(key, (deps = new Set()));
+        }
+        deps.add(activeEffect);
+        activeEffect.deps.push(deps);
+      }
+      function trigger(target, key, type) {
+        let depsMap = bucket.get(target);
+        if (!depsMap) return;
+        // 取得与key相关的副作用函数
+        let effects = depsMap.get(key);
+        // 取得与ITERATE_KEY相关的副作用函数
+        let iterateEffects = depsMap.get(ITERATE_KEY);
+        const effectsToRun = new Set();
+        effects &&
+          effects.forEach((effectFn) => {
+            if (effectFn !== activeEffect) {
+              effectsToRun.add(effectFn);
+            }
+          });
+        if (type === TriggerType["ADD"] || type === TriggerType["DELETE"]) {
+          iterateEffects &&
+            iterateEffects.forEach((effectFn) => {
+              if (effectFn !== activeEffect) {
+                effectsToRun.add(effectFn);
+              }
+            });
+        }
+
+        effectsToRun.forEach((effectFn) => {
+          if (effectFn.options.scheduler) {
+            effectFn.options.scheduler(effectFn);
+          } else {
+            effectFn();
+          }
+        });
+      }
+
+      function cleanup(effectFn) {
+        for (let index = 0; index < effectFn.deps.length; index++) {
+          const deps = effectFn.deps[index];
+          deps.delete(effectFn);
+        }
+        effectFn.deps.length = 0;
+      }
+
+      effect(() => {
+        for (const key in obj) {
+          console.log(key, 103);
+        }
+      });
+
+      setTimeout(() => {
+        obj.ccc = 3;
+      }, 1000);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<body>
+  <div id="app1">app</div>
+  <div id="app2">app</div>
+    <script>
+      let activeEffect;
+      const effectStack = [];
+      let effect = function(fn, options = {}) {
+        const effectFn = () => {
+          activeEffect = effectFn;
+          cleanup(effectFn);
+          
+          // 在调用副作用函数之前将当前副作用函数压入栈中
+          effectStack.push(effectFn);
+          const res = fn();
+          effectStack.pop();
+          activeEffect = effectStack[effectStack.length - 1];
+          return res
+        }
+        effectFn.options = options;
+        effectFn.deps = [];
+        if(!options.lazy) {
+          effectFn();
+        }
+        return effectFn
+        
+      }
+      let bucket = new WeakMap();
+      let data = {
+        foo: 1,
+        bar: 1,
+      }
+      let obj = new Proxy(data, {
+        get(target, key){
+          track(target, key)
+          return target[key];
+        },
+        set(target, key, value) {
+          target[key] = value;
+          trigger(target, key);
+          return true
+        }
+      });
+
+      function track(target, key) {
+        if(!activeEffect) return
+        let depsMap = bucket.get(target);
+          if(!depsMap) {
+            bucket.set(target, depsMap = new Map());
+          }
+          let deps = depsMap.get(key);
+          if(!deps) {
+            depsMap.set(key, deps = new Set());
+          }
+          deps.add(activeEffect);
+          activeEffect.deps.push(deps);
+      }
+      function trigger(target, key) {
+        let depsMap = bucket.get(target);
+          if(!depsMap) return
+        let effects = depsMap.get(key);
+        const effectsToRun = new Set();
+        effects && effects.forEach(effectFn => {
+          if(effectFn !== activeEffect) {
+            effectsToRun.add(effectFn)
+          }
+        })
+        effectsToRun.forEach(effectFn => {
+          if(effectFn.options.scheduler) {
+            effectFn.options.scheduler(effectFn);
+          } else {
+            effectFn();
+          }
+        });
+      }
+      function cleanup(effectFn) {
+        for (let index = 0; index < effectFn.deps.length; index++) {
+          const deps = effectFn.deps[index];
+          deps.delete(effectFn);
+        }
+        effectFn.deps.length = 0;
+      }
+      const jobQueue = new Set();
+      let isFulushing = false;
+      const p = Promise.resolve()
+      function flushJob() {
+        if(isFulushing) return
+        isFulushing = true;
+        p.then(() => {
+          jobQueue.forEach(job => job())
+        }).finally(() => {
+          isFulushing = false;
+        })
+      }
+     
+     
+      // effect(() => {
+      //   console.log(obj.foo)
+      // }, {
+      //   scheduler: (fn) => {
+      //     jobQueue.add(fn);
+      //     flushJob()
+      //   }
+      // })
+
+      // obj.foo++;
+      // obj.foo++;
+
+      function computed(getter) {
+        debugger
+        let value;
+        let dirty = true;
+        const effectFn = effect(getter ,{lazy: true, scheduler: () => {
+          dirty = true;
+        }});
+        const obj = {
+          get value() {
+            if(dirty) {
+              value = effectFn();
+              dirty = false;
+            }
+            return value
+          }
+        }  
+        return obj
+      }
+
+      const sumRes = computed(() => obj.foo + obj.bar);
+      // console.log(sumRes.value);
+      // setTimeout(() => {
+      //   obj.foo++
+      //   console.log(sumRes.value);
+      // }, 1000);
+      effect(() => {
+        console.log(sumRes.value)
+      })
+      setTimeout(() => {
+        obj.foo++
+      }, 1000)
+
+
+      // // 全局变量
+      // let temp1, temp2
+
+      // // effectFn1 嵌套了 effectFn2
+      // effect(function effectFn1() {
+      //   console.log('effectFn1 执行')
+        
+      //   effect(function effectFn2() {
+      //     console.log('effectFn2 执行')
+      //     // 在 effectFn2 中读取 obj.bar 属性
+      //     temp2 = obj.bar
+      //   })
+      //   // 在 effectFn1 中读取 obj.foo 属性
+      //   temp1 = obj.foo
+      // })
+
+
+      // effect(() => {
+      //   console.log("app1")
+      //   document.getElementById("app1").innerHTML = obj.isOk ? obj.text : "not";
+      // })
+      // effect(() => {
+      //   console.log("app2")
+      //   document.getElementById("app2").innerHTML = obj.isOk ? obj.text : "not";
+      // })
+
+      // setTimeout(() => {
+      //   obj.foo = false;
+      // }, 2000);
+
+      // setTimeout(() => {
+      //   obj.text = "hello Javascript!"
+      // }, 4000);
+    </script>
+    
+    <!-- <script>
+      const set1 = new Set();
+      function aa() {
+        console.log('aa')
+      }
+      function bb() {
+        console.log('bb')
+      }
+      function cc() {
+        console.log('cc')
+      }
+      function dd() {
+        console.log('dd')
+      }
+      set1.add(aa);
+      set1.add(bb);
+      set1.add(cc);
+      set1.add(dd);
+      console.log(set1, 45);
+      // const deps = []
+      
+      // deps.push(set1);
+      // for (let index = 0; index < deps.length; index++) {
+      //   const element = deps[index];
+      //   element.delete(aa);
+      // }
+      // console.log(deps, set1)
+      console.log("*************************************")
+      const newSet1 = new Set(set1)
+      console.log(newSet1, 100)
+      console.log(set1 == newSet1)
+    </script> -->
+</body>
+</html>

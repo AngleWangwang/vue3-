@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <body>
+    <script>
+      function getSequence(arr) {
+        debugger;
+        const p = arr.slice();
+        const result = [0];
+        let i, j, u, v, c;
+        const len = arr.length;
+        for (i = 0; i < len; i++) {
+          const arrI = arr[i];
+          if (arrI !== 0) {
+            j = result[result.length - 1];
+            if (arr[j] < arrI) {
+              p[i] = j;
+              result.push(i);
+              continue;
+            }
+            u = 0;
+            v = result.length - 1;
+            while (u < v) {
+              c = ((u + v) / 2) | 0;
+              if (arr[result[c]] < arrI) {
+                u = c + 1;
+              } else {
+                v = c;
+              }
+            }
+            if (arrI < arr[result[u]]) {
+              if (u > 0) {
+                p[i] = result[u - 1];
+              }
+              result[u] = i;
+            }
+          }
+        }
+        u = result.length;
+        v = result[u - 1];
+        while (u-- > 0) {
+          result[u] = v;
+          v = p[v];
+        }
+        return result;
+      }
+
+      // const arr = [3, 2, 8, 9, 5, 6, 7, 11, 15, 4, 1];
+      //  0, 1, 2, 3, 4, 5,  6,  7, 8
+      // const arr = [3, 2, 8, 9, 5, 11, 15, 4, 1];
+      const arr = [7, 8, 9, 1, 2, 10, 3];
+      //  [2, 5, 6, 7, 11, 15]
+      // [1, 4, 5, 6, 7, 8]
+      // const arr = [10, 20, 30, 40, 50, 60, 70, 80, 90, 9];
+      console.log(getSequence(arr));
+
+      /**
+       * 第一步：i = 0, arr[0] = 3, j = 0, p = [3, 2, 8, 9, 5, 6, 7, 11, 15, 4], result = [0], 结果：[3],
+       * 第二步：i = 1，arr[1] = 2, j = 0, p = [3, 2, 8, 9, 5, 6, 7, 11, 15, 4], result = [1], 结果：[2],
+       * 第三步：i = 2, arr[2] = 8, j = 1, p = [3, 2, 1, 9, 5, 6, 7, 11, 15, 4]，result = [1, 2], 结果：[2, 8]
+       * 第四步：i = 3, arr[3] = 9, j = 2, p = [3, 2, 1, 2, 5, 6, 7, 11, 15, 4], result = [1, 2，3],  结果：[2, 8, 9]
+       *
+       *
+       * 第五步：i = 4, arr[4] = 5, p = [3, 2, 1, 2, 1, 6, 7, 11, 15, 4], result = [1, 4，3],  结果：[2, 5, 9]
+       *  u = 0，v = 2, c = 1
+       *  u = 0, v = 1, c = 0
+       *  u = 1, v = 1
+       * 第六步：i = 5, arr[5] = 6, p = [3, 2, 1, 2, 1, 4, 7, 11, 15, 4], result = [1, 4，5],   结果：[2, 5, 6]
+       *  u = 0，v = 2, c = 1
+       *  u = 2, v = 2,
+       * 第七步：i = 6, arr[6] = 7, p = [3, 2, 1, 2, 1, 4, 5, 11, 15, 4], result = [1, 4，5，6],   结果：[2, 5, 6, 7]
+       * 第八步：i = 7, arr[7] = 11, p = [3, 2, 1, 2, 1, 4, 5, 6, 15, 4], result = [1, 4，5，6，7],   结果：[2, 5, 6, 7, 11],
+       * 第九步：i = 8, arr[8] = 15, p = [3, 2, 1, 2, 1, 4, 5, 6, 7, 4], result = [1, 4，5，6，7，8],   结果：[2, 5, 6, 7, 15],
+       * 第十步：i = 9, arr[9] = 4, result = [1, 9，5，6，7，8],  p = [3, 2, 1, 2, 1, 4, 5, 6, 7, 1]
+       *  u = 0，v = 5, c = 2
+       *  u = 0, v = 2, c = 1
+       *  u = 0, v = 1, c = 0
+       *  u = 1, v = 1,
+       * for循环结束
+       *  u = 6, v = 8
+       *
+       *
+       *
+       *
+       *
+       *
+       * */
+    </script>
+  </body>
+</html>

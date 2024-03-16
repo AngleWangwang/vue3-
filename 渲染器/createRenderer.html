@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <body>
+    <div id="app" class="xxx"></div>
+    <script>
+      let activeEffect;
+      const effectStack = [];
+      let effect = function (fn, options = {}) {
+        // debugger;
+        const effectFn = () => {
+          activeEffect = effectFn;
+          cleanup(effectFn);
+
+          // 在调用副作用函数之前将当前副作用函数压入栈中
+          effectStack.push(effectFn);
+          const res = fn();
+          effectStack.pop();
+          activeEffect = effectStack[effectStack.length - 1];
+          return res;
+        };
+        effectFn.options = options;
+        effectFn.deps = [];
+        if (!options.lazy) {
+          effectFn();
+        }
+        return effectFn;
+      };
+      let bucket = new WeakMap();
+      // 原始数据的标志
+      let TARGET_KEY = Symbol();
+      // 可迭代方法的key
+      const ITERATE_KEY = Symbol();
+      const TriggerType = {
+        SET: "SET",
+        ADD: "ADD",
+        DELETE: "DELETE",
+      };
+      // 一个标记变量，代表是否进行追踪。默认值为 true，即允许追踪
+      let shouldTrack = true;
+      const arraryInstrumentations = {};
+      // 可迭代Map集合 Symbol.iterator 和 entries等价，抽取出来
+      const iterationMethod = function () {
+        const target = this[TARGET_KEY];
+        const itr = target[Symbol.iterator]();
+        const wrap = (val) =>
+          typeof val === "object" && val !== null ? reactive(val) : val;
+        // 调用 track 函数建立响应联系
+        track(target, ITERATE_KEY);
+        return {
+          // 重写迭代器的next方法
+          next() {
+            const { value, done } = itr.next();
+            return {
+              value: value ? [wrap(value[0]), wrap(value[1])] : value,
+              done,
+            };
+          },
+          [Symbol.iterator]() {
+            return this;
+          },
+        };
+      };
+      const valuesIterationMethod = function () {
+        const target = this[TARGET_KEY];
+        const itr = target.values();
+        const wrap = (val) =>
+          typeof val === "object" && val !== null ? reactive(val) : val;
+        // 调用 track 函数建立响应联系
+        track(target, ITERATE_KEY);
+        return {
+          // 重写迭代器的next方法
+          next() {
+            const { value, done } = itr.next();
+            return {
+              value: wrap(value),
+              done,
+            };
+          },
+          [Symbol.iterator]() {
+            return this;
+          },
+        };
+      };
+      const MAP_KEY_ITERATE_KEY = Symbol();
+      const keysIterationMethod = function () {
+        const target = this[TARGET_KEY];
+        const itr = target.keys();
+        const wrap = (val) =>
+          typeof val === "object" && val !== null ? reactive(val) : val;
+        // 调用 track 函数建立响应联系
+        track(target, MAP_KEY_ITERATE_KEY);
+        return {
+          // 重写迭代器的next方法
+          next() {
+            const { value, done } = itr.next();
+            return {
+              value: wrap(value),
+              done,
+            };
+          },
+          [Symbol.iterator]() {
+            return this;
+          },
+        };
+      };
+      const mutableInstrumentations = {
+        // 重写可迭代方法
+        [Symbol.iterator]: iterationMethod,
+        // entries
+        entries: iterationMethod,
+        values: valuesIterationMethod,
+        keys: keysIterationMethod,
+        // 重写forEach方法
+        forEach: function (callBack, thisArg) {
+          // wrap 函数用来把可代理的值转换为响应式数据
+          const wrap = (val) =>
+            typeof val === "object" && val !== null ? reactive(val) : val;
+          const target = this[TARGET_KEY];
+          // 与 ITERATE_KEY 建立响应联系
+          track(target, ITERATE_KEY);
+          target.forEach((v, k) => {
+            callBack.call(thisArg, wrap(v), wrap(k), this);
+          });
+        },
+        // 重写Map类型数据的set方法
+        set: function (key, value) {
+          // this 仍然指向的是代理对象，通过 TARGET_KEY 属性获取原始数据对象
+          const target = this[TARGET_KEY];
+          const hasKey = target.has(key);
+          // 获取旧值
+          const oldValue = target.get(key);
+
+          const rawValue = value[TARGET_KEY] || value;
+
+          // 设置新值
+          target.set(key, rawValue);
+          if (!hasKey) {
+            // 如果不存在，则说明是 ADD 类型的操作，意味着新增
+            trigger(target, key, TriggerType["ADD"]);
+          } else if (
+            oldValue !== value ||
+            (oldValue === oldValue && value === value)
+          ) {
+            trigger(target, key, TriggerType["SET"]);
+          }
+        },
+        // 重写Map类型数据的get方法
+        get: function (key) {
+          // this 仍然指向的是代理对象，通过 TARGET_KEY 属性获取原始数据对象
+          const target = this[TARGET_KEY];
+          const hasKey = target.has(key);
+          track(target, key);
+
+          if (hasKey) {
+            const res = target.get(key);
+            return typeof res === "object" ? reactive(res) : res;
+          }
+        },
+        // 重写Set类型数据的add方法
+        add: function (key) {
+          // this 仍然指向的是代理对象，通过 TARGET_KEY 属性获取原始数据对象
+          const target = this[TARGET_KEY];
+          const hasKey = target.has(key);
+          // 通过原始数据对象执行 add 方法添加具体的值，
+          // 注意，这里不再需要 .bind 了，因为是直接通过 target 调用并执行的
+          const res = target.add(key);
+          // 当添加一个不存在的数据时触发
+          if (!hasKey) {
+            // 调用 trigger 函数触发响应，并指定操作类型为 ADD
+            trigger(target, key, TriggerType["ADD"]);
+          }
+          return res;
+        },
+        // 重写Set、Map类型数据的delete方法
+        delete: function (key) {
+          // this 仍然指向的是代理对象，通过 TARGET_KEY 属性获取原始数据对象
+          const target = this[TARGET_KEY];
+          const hasKey = target.has(key);
+          // 通过原始数据对象执行 add 方法添加具体的值，
+          // 注意，这里不再需要 .bind 了，因为是直接通过 target 调用并执行的
+          const res = target.delete(key);
+          // 当要删除的元素确实存在时，才触发响应
+          if (hasKey) {
+            // 调用 trigger 函数触发响应，并指定操作类型为 ADD
+            trigger(target, key, TriggerType["DELETE"]);
+          }
+
+          return res;
+        },
+      };
+      [
+        // 重写数组的堆栈方法
+        ("push", "pop", "shift", "unshift", "splice"),
+      ].forEach((method) => {
+        arraryInstrumentations[method] = function (...args) {
+          // 取得原始 push 方法
+          const originMethod = Array.prototype[method];
+          // 在调用原始方法之前，禁止追踪
+          shouldTrack = false;
+          // push 方法的默认行为
+          let res = originMethod.apply(this, args);
+          // 在调用原始方法之后，恢复原来的行为，即允许追踪
+          shouldTrack = true;
+          return res;
+        };
+      });
+      // 重写数组的查找方法
+      ["includes", "indexOf", "lastIndexOf"].forEach((method) => {
+        const originMethod = Array.prototype[method];
+        arraryInstrumentations[method] = function (...args) {
+          // this 是代理对象，先在代理对象中查找，将结果存储到 res 中
+          let res = originMethod.apply(this, args);
+          if (res === false) {
+            // res 为 false 说明没找到，通过 this[TARGET_KEY] 拿到原始数组，再去其中查找并更新 res 值
+            res = originMethod.apply(this[TARGET_KEY], args);
+          }
+          // 返回最终的结果
+          return res;
+        };
+      });
+
+      function createReactive(obj, isShallow = false, isReadonly = false) {
+        return new Proxy(obj, {
+          // 访问属性 响应式拦截使用get，set
+          get(target, key, receiver) {
+            // debugger;
+            if (key === TARGET_KEY) {
+              return target;
+            }
+            if (key === "size") {
+              // 读取Set和Map的size属性时
+              track(target, ITERATE_KEY);
+              return Reflect.get(target, key, target);
+            }
+            // 如果操作的目标对象是数组，并且key存在于arraryInstrumentations上
+            // 那么返回定义在 arrayInstrumentations 上的值
+            // 并且调用arr的include等方法时不需要对include进行追踪，因为include方法本身就会对索引值和length属性进行追踪
+            if (
+              Array.isArray(target) &&
+              arraryInstrumentations.hasOwnProperty(key)
+            ) {
+              return Reflect.get(arraryInstrumentations, key, receiver);
+            }
+            // Set/Map类型数据的截取
+            if (mutableInstrumentations.hasOwnProperty(key)) {
+              return mutableInstrumentations[key];
+            }
+
+            // 添加判断，如果 key 的类型是 symbol，则不进行追踪
+            // forof循环遍历数组时，不需要对symbol类型的key进行追踪
+            if (!isReadonly && typeof key !== "symbol") {
+              track(target, key);
+            }
+            const res = Reflect.get(target, key, receiver);
+            // 浅响应
+            if (isShallow) {
+              return res;
+            }
+            if (typeof res === "object" && res !== null) {
+              return isReadonly ? readonly(res) : reactive(res);
+            }
+            // return target[key];
+            return res;
+          },
+          set(target, key, newVal, receiver) {
+            // 如果是只读，则打印警告信息并返回
+            if (isReadonly) {
+              console.warn(`属性 ${key} 是只读的`);
+
+              return true;
+            }
+
+            const type =
+              // 增加数组的判断
+              Array.isArray(target)
+                ? // 如果代理目标是数组，则检测被设置的索引值是否小于数组长度，
+
+                  // 如果是，则视作 SET 操作，否则是 ADD 操作
+                  Number(key) >= target.length
+                  ? TriggerType["ADD"]
+                  : TriggerType["SET"]
+                : // 如果属性不存在，则说明是在添加新的属性，否则是设置已有属性
+                Object.prototype.hasOwnProperty.call(target, key)
+                ? TriggerType["SET"]
+                : TriggerType["ADD"];
+
+            // 先获取旧值
+            const oldVal = target[key];
+            // 再设置
+            const res = Reflect.set(target, key, newVal, receiver);
+            if (target === receiver[TARGET_KEY]) {
+              // 比较新值与旧值，只有当它们不全等，并且不都是 NaN 的时候才触发响应
+              if (
+                oldVal !== newVal &&
+                (oldVal === oldVal || newVal === newVal)
+              ) {
+                trigger(target, key, type, newVal);
+              }
+            }
+
+            // target[key] = value;
+
+            return res;
+          },
+          // in关键字访问使用has拦截
+          has(target, key) {
+            track(target, key);
+            return Reflect.has(target, key);
+          },
+          // for...in循环遍历对象
+          ownKeys(target) {
+            // forin普通对象时将副作用函数与 ITERATE_KEY 关联
+            // 如果操作目标 target 是数组，则使用 length 属性作为 key 并建立响应联系
+            track(target, Array.isArray(target) ? "length" : ITERATE_KEY);
+            return Reflect.ownKeys(target);
+          },
+          deleteProperty(target, key) {
+            // 检查被操作的属性是否是对象自己的属性
+            const hasKey = Object.prototype.hasOwnProperty.call(target, key);
+            // 使用Reflect.deleteProperty完成删除
+            const res = Reflect.defineProperty(target, key);
+            // 只有当被删除的属性是对象自己的属性并且成功删除时，才触发更新
+            if (res && hasKey) {
+              trigger(target, key, TriggerType["DELETE"]);
+            }
+          },
+        });
+      }
+
+      function track(target, key) {
+        if (!activeEffect || !shouldTrack) return;
+        let depsMap = bucket.get(target);
+        if (!depsMap) {
+          bucket.set(target, (depsMap = new Map()));
+        }
+        let deps = depsMap.get(key);
+        if (!deps) {
+          depsMap.set(key, (deps = new Set()));
+        }
+        deps.add(activeEffect);
+        activeEffect.deps.push(deps);
+      }
+      function trigger(target, key, type, newVal) {
+        let depsMap = bucket.get(target);
+        if (!depsMap) return;
+        // 取得与key相关的副作用函数
+        let effects = depsMap.get(key);
+        // 取得与ITERATE_KEY相关的副作用函数
+        let iterateEffects = depsMap.get(ITERATE_KEY);
+        const effectsToRun = new Set();
+
+        effects &&
+          effects.forEach((effectFn) => {
+            if (effectFn !== activeEffect) {
+              effectsToRun.add(effectFn);
+            }
+          });
+
+        // 当操作类型为 ADD 并且目标对象是数组时，应该取出并执行那些与 length属性相关联的副作用函数
+        if (Array.isArray(target) && type === TriggerType["ADD"]) {
+          // 取出与length相关联的副作用函数
+          const lengthsEffects = depsMap.get("length");
+          lengthsEffects &&
+            lengthsEffects.forEach((effectFn) => {
+              if (effectFn !== activeEffect) {
+                effectsToRun.add(effectFn);
+              }
+            });
+        }
+        // 如果操作目标是数组，并且修改了数组的 length 属性
+        if (Array.isArray(target) && key === "length") {
+          depsMap.forEach((effects, depKey) => {
+            // 对于索引大于或等于新的 length 值的元素，
+            // 需要把所有相关联的副作用函数取出并添加到 effectsToRun 中待执行
+            if (depKey >= newVal) {
+              effects.forEach((effectFn) => {
+                if (effectFn !== activeEffect) {
+                  effectsToRun.add(effectFn);
+                }
+              });
+            }
+          });
+        }
+
+        // forin遍历对象时 只有新增或者删除才会触发副作用函数响应
+        if (
+          type === TriggerType["ADD"] ||
+          type === TriggerType["DELETE"] ||
+          // 如果操作类型是 SET，并且目标对象是 Map 类型的数据，
+          // 也应该触发那些与 ITERATE_KEY 相关联的副作用函数重新执行
+          (type === TriggerType["SET"] &&
+            Object.prototype.toString.call(target) === "[object Map]")
+        ) {
+          iterateEffects &&
+            iterateEffects.forEach((effectFn) => {
+              if (effectFn !== activeEffect) {
+                effectsToRun.add(effectFn);
+              }
+            });
+        }
+
+        // Map集合forof循环keys方法时，只有新增或者删除key才能够触发相关的副作用函数,修改值时不应该触发与keys相关的副作用
+        if (
+          (type === TriggerType["ADD"] || type === TriggerType["DELETE"]) &&
+          Object.prototype.toString.call(target) === "[object Map]"
+        ) {
+          const iterateEffects = depsMap.get(MAP_KEY_ITERATE_KEY);
+          iterateEffects &&
+            iterateEffects.forEach((effectFn) => {
+              if (effectFn !== activeEffect) {
+                effectsToRun.add(effectFn);
+              }
+            });
+        }
+
+        effectsToRun.forEach((effectFn) => {
+          if (effectFn.options.scheduler) {
+            effectFn.options.scheduler(effectFn);
+          } else {
+            effectFn();
+          }
+        });
+      }
+
+      function cleanup(effectFn) {
+        for (let index = 0; index < effectFn.deps.length; index++) {
+          const deps = effectFn.deps[index];
+          deps.delete(effectFn);
+        }
+        effectFn.deps.length = 0;
+      }
+      const reactiveMap = new Map();
+      function reactive(obj) {
+        // 优先通过原始对象 obj 寻找之前创建的代理对象，如果找到了，直接返回已有的代理对象
+        const existionProxy = reactiveMap.get(obj);
+        if (existionProxy) return existionProxy;
+        const proxy = createReactive(obj);
+        reactiveMap.set(obj, proxy);
+        return proxy;
+      }
+      function shallowReactive(obj) {
+        return createReactive(obj, true);
+      }
+      function readonly(obj) {
+        return createReactive(obj);
+      }
+      function shallowReadonly(obj) {
+        return createReactive(obj, true);
+      }
+      function ref(val) {
+        const wrapper = {
+          value: val,
+        };
+        Object.defineProperty(wrapper, "__v_isRef", { value: true });
+        return reactive(wrapper);
+      }
+      function proxyRefs(obj) {
+        return new Proxy(obj, {
+          get(target, key, receiver) {
+            const value = Reflect.get(target, key, receiver);
+            return value.__v_isRef ? value.value : value;
+          },
+          set(target, key, newValue, receiver) {
+            const value = target[key];
+            if (value.__v_isRef) {
+              value.value = newValue;
+              return true;
+            }
+            return Reflect(target, key, newValue, receiver);
+          },
+        });
+      }
+      function toRef(obj, key) {
+        const wrapper = {
+          get value() {
+            return obj[key];
+          },
+          set value(val) {
+            obj[key] = val;
+          },
+        };
+        Object.defineProperty(wrapper, "__v_isRef", { value: true });
+        return wrapper;
+      }
+      function toRefs(obj) {
+        const wrapper = {};
+        for (const key in obj) {
+          wrapper[key] = toRef(obj, key);
+        }
+
+        return wrapper;
+      }
+      // 描述文本节点
+      const Text = Symbol();
+      // 注释节点的 type 标识
+      const Comment = Symbol();
+      function shouldSetAsProps(el, key, value) {
+        // 特殊处理
+        if (key === "form" && el.tagName === "INPUT") return false;
+        // 兜底
+        return key in el;
+      }
+
+      // 任务缓存队列，用一个 Set 数据结构来表示，这样就可以自动对任务进行去重
+      const queue = new Set();
+      const p = Promise.resolve();
+      let isFlushing = false;
+      function queueJob(job) {
+        queue.add(job);
+        // 如果还没有开始刷新队列，则刷新之
+        if (!isFlushing) {
+          // 将该标志设置为 true 以避免重复刷新
+          isFlushing = true;
+          p.then(() => {
+            try {
+              queue.forEach((job) => job());
+            } finally {
+              // 重置状态
+              isFlushing = true;
+              queue.clear = 0;
+            }
+          });
+        }
+      }
+      function createRenderer(options) {
+        // debugger;
+        const {
+          createElement,
+          insert,
+          setElementText,
+          patchProps,
+          createText,
+          setText,
+        } = options;
+
+        // 首次挂载元素
+        function mountElement(vnode, container, anchor) {
+          // const el = document.createElement(vnode.type)
+          const el = (vnode.el = createElement(vnode.type));
+          // 处理props
+          if (vnode.props) {
+            // 遍历 vnode.props
+            for (const key in vnode.props) {
+              const value = vnode.props[key];
+              patchProps(el, key, null, value);
+            }
+          }
+          // 处理子节点，如果子节点是字符串，代表元素具有文本节点
+          if (typeof vnode.children === "string") {
+            // 因此只需要设置元素的 textContent 属性即可
+            // el.textContent = vnode.children;
+            setElementText(el, vnode.children);
+          } else if (Array.isArray(vnode.children)) {
+            vnode.children.forEach((child) => {
+              patch(null, child, el);
+            });
+          }
+          // container.appendChild(el);
+          insert(el, container, anchor);
+        }
+        function patchKeyedChildren(n1, n2, container) {
+          if (Array.isArray(n1.children)) {
+            // 判断旧子节点是否也是一组子节点
+            // 代码运行到这里，则说明新旧子节点都是一组子节点，这里涉及核心的Diff 算法
+            const oldChildren = n1.children;
+            const newChildren = n2.children;
+            // 更新相同的前置节点
+            let j = 0;
+            let oldVNode = oldChildren[j];
+            let newVNode = newChildren[j];
+            while (oldVNode.key === newVNode.key) {
+              patch(oldVNode, newVNode, container);
+              j++;
+              oldVNode = oldChildren[j];
+              newVNode = newChildren[j];
+            }
+
+            // 更新相同的后置节点
+            // 索引 oldEnd 指向旧的一组子节点的最后一个节点
+            let oldEnd = oldChildren.length - 1;
+            // 索引 newEnd 指向新的一组子节点的最后一个节点
+            let newEnd = newChildren.length - 1;
+
+            oldVNode = oldChildren[oldEnd];
+            newVNode = newChildren[newEnd];
+
+            // while 循环从后向前遍历，直到遇到拥有不同 key 值的节点为止
+            while (oldVNode.key === newVNode.key) {
+              // 调用 patch 函数进行更新
+              patch(oldVNode, newVNode, container);
+              // 递减 oldEnd 和 nextEnd
+              oldEnd--;
+              newEnd--;
+              oldVNode = oldChildren[oldEnd];
+              newVNode = newChildren[newEnd];
+            }
+            // 预处理完毕后，如果满足如下条件，则说明从 j --> newEnd 之间的节点应作为新节点插入
+            if (j > oldEnd && j <= newEnd) {
+              // 锚点的索引
+              const anchorIndex = newEnd + 1;
+              // 锚点元素
+              const anchor =
+                anchorIndex < newChildren.length
+                  ? newChildren[anchorIndex].el
+                  : null;
+              // 采用 while 循环，调用 patch 函数逐个挂载新增节点
+              while (j <= newEnd) {
+                patch(null, newChildren[j++], container, anchor);
+              }
+            } else if (j > newEnd && j <= oldEnd) {
+              // 预处理完毕后，如果满足如下条件，则说明从 j --> oldEnd 之间的节点应删除
+
+              // 采用 while 循环，调用 unmount 函数逐个卸载节点
+              while (j <= newEnd) {
+                unmount(oldChildren[j++]);
+              }
+            } else {
+              // 新的一组子节点中剩余未处理节点的数量
+              const count = newEnd - j + 1;
+              // 构造source数组， 用来存储新节点在旧节点中的索引值
+              const source = new Array(count);
+              // 填充初始值-1
+              source.fill(-1);
+
+              // oldStart 和 newStart 分别为起始索引，即 j
+              const oldStart = j;
+              const newStart = j;
+              // 是否移动
+              let move = false;
+              // 新节点中的最大索引值
+              let pos = 0;
+              // 代表更新过的节点数量
+              let patched = 0;
+              // 构建索引表, 新节点中key值与索引表之间的映射
+              const keyIndex = {};
+              for (let i = newStart; i < newEnd; i++) {
+                keyIndex[newChildren[i].key] = i;
+              }
+              // 遍历旧的一组子节点中剩余未处理的节点
+              for (let i = oldStart; i < oldEnd; i++) {
+                oldVnode = oldChildren[i];
+                // 如果更新过的节点数量小于等于需要更新的节点数量，则执行更新
+                if (patched <= count) {
+                  const k = keyIndex[oldVnode.key];
+                  if (typeof k !== "undefined") {
+                    newVNode = newChildren[k];
+                    // 调用 patch 函数完成更新
+                    patch(oldVNode, newVNode, container);
+                    // 填充 source 数组
+                    source[k - newStart] = i;
+                    if (k < pos) {
+                      // 移动
+                      move = true;
+                      // 每更新一个节点，都将 patched 变量 +1
+                      patched++;
+                    } else {
+                      pos = k;
+                    }
+                  } else {
+                    // 没找到
+                    unmount(oldVNode);
+                  }
+                } else {
+                  // 如果更新过的节点数量大于需要更新的节点数量，则卸载多余的节点
+                  unmount(oldVNode);
+                }
+              }
+
+              if (move) {
+                // 如果 moved 为真，则需要进行 DOM 移动操作
+              }
+              // 双重for循环，复杂维度为(n1*n2), 使用索引表降低for循环的维度
+              // for (let i = oldStart; i < oldChildren.length; i++) {
+              //   const oldVnode = oldChildren[i]
+              //   for (let k = newStart; k < newChildren.length; k++) {
+              //     const newVnode = newChildren[k]
+              //     if(oldVNode.key === newVnode.key) {
+              //       source[k-newStart] = i
+              //     }
+              //   }
+              // }
+            }
+
+            // 双端算法
+            // 四个索引值
+            // let oldStartIdx = 0;
+            // let oldEndIdx = oldChildren.length - 1;
+            // let newStartIdx = 0;
+            // let newEndIdx = newChildren.length - 1;
+            // // 四个索引指向的 vnode 节点
+            // let oldStartVNode = oldChildren[oldStartIdx];
+            // let oldEndVNode = oldChildren[oldEndIdx];
+            // let newStartVNode = newChildren[newStartIdx];
+            // let newEndVNode = newChildren[newEndIdx];
+            // while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+            //   if (!oldStartVNode) {
+            //     oldStartVNode = oldChildren[++oldStartIdx];
+            //   } else if (!oldEndVNode) {
+            //     oldEndVNode = oldChildren[--oldEndIdx];
+            //   } else if (oldStartVNode.key === newStartVNode.key) {
+            //     // 第一步：oldStartVNode 和 newStartVNode 比较
+            //     // 节点在新的顺序中仍然处于头部，不需要移动，但仍需打补丁
+            //     patch(oldStartVNode, newStartVNode, container);
+            //     oldStartVNode = oldChildren[++oldStartIdx];
+            //     newStartVNode = newChildren[++newStartIdx];
+            //   } else if (oldEndVNode.key === newEndVNode.key) {
+            //     // 第二步：oldEndVNode 和 newEndVNode 比较
+            //     // 步骤二：oldEndVNode 和 newEndVNode 比较
+            //     // 节点在新的顺序中仍然处于尾部，不需要移动，但仍需打补丁
+            //     patch(oldEndVNode, newEndVNode, container);
+            //     // 更新索引和头尾部节点变量
+            //     oldEndVNode = oldChildren[--oldEndIdx];
+            //     newEndVNode = newChildren[--newEndIdx];
+            //   } else if (oldStartVNode.key === newEndVNode.key) {
+            //     // 第三步：oldStartVNode 和 newEndVNode 比较
+            //     // 仍然需要调用 patch 函数进行打补丁
+            //     patch(oldEndVNode, newStartVNode, container);
+            //     // oldStartVNode.el 移动到 oldEndVNode.el 前面
+            //     insert(oldStartVNode.el, container, oldEndVNode.el);
+            //     oldStartVNode = oldChildren[++oldStartIdx];
+            //     newEndVNode = newChildren[--newEndIdx];
+            //   } else if (oldEndVNode.key === newStartVNode.key) {
+            //     // 第四步：oldEndVNode 和 newStartVNode 比较
+            //     // 仍然需要调用 patch 函数进行打补丁
+            //     patch(oldEndVNode, newStartVNode, container);
+            //     // oldEndVNode.el 移动到 oldStartVNode.el 前面
+            //     insert(oldEndVNode.el, container, oldStartVNode.el);
+            //     // 移动 DOM 完成后，更新索引值，并指向下一个位置
+            //     oldEndVNode = oldChildren[--oldEndIdx];
+            //     newStartVNode = newChildren[++newStartIdx];
+            //   } else {
+            //     // 遍历旧的一组子节点，试图寻找与 newStartVNode 拥有相同 key 值的节点
+            //     const idxInOld = oldChildren.findIndex(
+            //       (node) => node.key === newStartVNode.key
+            //     );
+            //     if (idxInOld > 0) {
+            //       // 不要忘记除移动操作外还应该打补丁
+            //       patch(oldChildren[idxInOld], newStartVNode, container);
+            //       insert(newStartVNode.el, container, oldStartVNode.el);
+            //       oldChildren[idxInOld] = undefined;
+            //     } else {
+            //       // 找不到意味着新增
+            //       patch(null, newStartVNode, container, oldStartVNode.el);
+            //     }
+            //     newStartVNode = newChildren[++newStartIdx];
+            //   }
+            // }
+
+            // // 循环完之后检查
+            // if(oldStartIdx > oldEndIdx && newStartIdx <= newEndIdx) {
+            //   // 存在新的vnode还没有匹配上的
+            //   for (let i = newStartIdx; i <= newEndIdx; i++) {
+            //     patch(null, newChildren[i], container, oldStartVNode.el)
+            //   }
+            // } else if(newEndIdx < newStartIdx && oldStartIdx <= oldEndIdx) {
+            //   // 存在旧的vnode没有删除的情况
+            //   for (let i = oldStartIdx; i <= oldEndIdx; i++) {
+            //     unmount(oldChildren[i])
+            //   }
+            // }
+
+            // 简单粗暴的修改属性，新增新的子节点，或者删除旧的多余的节点，但是没有做到dom的移动
+            // const oldLen = oldChildren.length;
+            // const newLen = newChildren.length;
+
+            // const commoneLenght = Math.min(oldLen, newLen);
+            // for (let i = 0; i < commoneLenght; i++) {
+            //   patch(oldChildren[i], newChildren[i], container);
+            // }
+            // // 如果 newLen > oldLen，说明有新子节点需要挂载
+            // if (newLen > oldLen) {
+            //   for (let i = commonLength; i < newLen; i++) {
+            //     patch(null, newChildren[i], container);
+            //   }
+            // } else if (oldLen > newLen) {
+            //   // 如果 oldLen > newLen，说明有旧子节点需要卸载
+            //   for (let i = commonLength; i < oldLen; i++) {
+            //     unmount(oldChildren[i]);
+            //   }
+            // }
+
+            // 用来存储寻找过程中遇到的最大索引值，这样会存在多余的dom操作
+            // let lastIndex = 0;
+            // let newLen = newChildren.length;
+            // let oldLen = oldChildren.length;
+            // for (let i = 0; i < newLen; i++) {
+            //   const newVNode = newChildren[i];
+            //   let find = false;
+            //   for (let j = 0; j < oldLen; j++) {
+            //     const oldVNode = oldChildren[j];
+            //     if (newVNode.key === oldVNode.key) {
+            //       find = true;
+            //       // 先打补丁，此操作会将新旧的props，以及内容全部更新，之后再在新旧虚拟dom中同步真实的dom元素，el
+            //       patch(oldVNode, newVNode, container);
+            //       if (j < lastIndex) {
+            //         // 代码运行到这里，说明 newVNode 对应的真实 DOM 需要移动
+            //         // 先获取 newVNode 的前一个 vnode，即 prevVNode
+            //         const prevVnode = newChildren[i - 1];
+            //         if (prevVnode) {
+            //           // 由于我们要将 newVNode 对应的真实 DOM 移动到prevVNode 所对应真实 DOM 后面，
+            //           // 所以我们需要获取 prevVNode 所对应真实 DOM 的下一个兄弟节点，并将其作为锚点
+            //           const anchor = prevVnode.el.nextSibling;
+            //           // 调用 insert 方法将 newVNode 对应的真实 DOM 插入到锚点元素前面，
+            //           // 也就是 prevVNode 对应真实 DOM 的后面
+            //           insert(newVNode.el, container, anchor);
+            //         }
+            //       } else {
+            //         lastIndex = j;
+            //       }
+            //       break;
+            //     }
+            //   }
+            //   // 新增元素
+            //   if (!find) {
+            //     const prevVnode = newChildren[i - 1];
+            //     let anchor = null;
+            //     if (prevVnode) {
+            //       anchor = prevVnode.el.nextSibling;
+            //     } else {
+            //       anchor = container.firstChild;
+            //     }
+            //     patch(null, newVNode, container, anchor);
+            //   }
+            // }
+
+            // // 删除元素
+            // for (let k = 0; k < oldLen; k++) {
+            //   const oldVNode = oldChildren[k];
+            //   const has = newChildren.find(
+            //     (vnode) => vnode.key === oldVNode.key
+            //   );
+            //   if (!has) unmount(oldVNode);
+            // }
+          } else {
+            // 此时： 旧子节点要么是文本子节点，要么不存在
+            // 但无论哪种情况，我们都只需要将容器清空，然后将新的一组子节点逐个挂载
+            setElementText(container, "");
+            n2.children.forEach((c) => patch(null, c, container));
+          }
+        }
+        function patchChildren(n1, n2, container) {
+          // 判断新子节点的类型是否是文本节点
+          if (typeof n2.children === "string") {
+            // 旧子节点的类型有三种可能：没有子节点、文本子节点以及一组子节点
+            // 只有当旧子节点为一组子节点时，才需要逐个卸载，其他情况下什么都不需要做
+            if (Array.isArray(n1.children)) {
+              n1.children.forEach((c) => unmount(c));
+            }
+            // 最后将新的文本节点内容设置给容器元素
+            setElementText(container, n2.children);
+          } else if (Array.isArray(n2.children)) {
+            // 说明新子节点是一组子节点
+            patchKeyedChildren(n1, n2, container);
+          } else {
+            // 代码运行到这里，说明新子节点不存在
+            // 旧子节点是一组子节点，只需逐个卸载即可
+            if (Array.isArray(n1.children)) {
+              n1.children.forEach((c) => unmount(c));
+            } else if (typeof n1.children === "string") {
+              // 旧子节点是文本子节点，清空内容即可
+              setElementText(container, "");
+            }
+            // 如果也没有旧子节点，那么什么都不需要做
+          }
+        }
+        // 更新元素
+        function patchElement(n1, n2) {
+          const el = (n2.el = n1.el);
+          const oldProps = n1.props;
+          const newProps = n2.props;
+          // 第一步：更新 props
+          for (const key in newProps) {
+            if (newProps[key] !== oldProps[key]) {
+              patchProps(el, key, oldProps[key], newProps[key]);
+            }
+          }
+          for (const key in oldProps) {
+            if (!(key in newProps)) {
+              patchProps(el, key, oldProps[key], null);
+            }
+          }
+          // 第二步：更新 children
+          patchChildren(n1, n2, el);
+        }
+
+        function resolveProps(options, propsData) {
+          const props = {};
+          const attrs = {};
+          for (const key in propsData) {
+            if (key in options) {
+              // 需要父组件传递props
+              props[key] = propsData[key];
+            } else {
+              // 组件自身的attrs
+              attrs[key] = propsData[key];
+            }
+          }
+          return [props, attrs];
+        }
+        // 首次挂载组件
+        function mountComponent(vnode, container, anchor) {
+          // 通过 vnode 获取组件的选项对象，即 vnode.type
+          const componentOptions = vnode.type;
+          // 获取组件的渲染函数 render
+          const {
+            render,
+            data,
+            props: propsOption,
+            beforeCreate,
+            created,
+            beforMount,
+            mounted,
+            beforeUpdate,
+            updated,
+          } = componentOptions;
+          // 在这里调用 beforeCreate 钩子
+          beforeCreate && beforeCreate();
+          // 调用 data 函数得到原始数据，并调用 reactive 函数将其包装为响应式数据
+          const state = reactive(data());
+          const [props, attrs] = resolveProps(propsOption, vnode.props);
+          // 定义组件实例，一个组件实例本质上就是一个对象，它包含与组件相关的状态信息
+          const instance = {
+            state, // 组件自身的状态，即data
+            props: shallowReactive(props),
+            isMounted: false, // 一个布尔值，用来表示组件是否已经被挂载，初始值为false
+            subTree: null, // 组件渲染的内容，即子树
+          };
+          // 将组件实例设置到 vnode 上，用于后续更新
+          vnode.component = instance;
+          // 创建渲染上下文对象，本质上是组件实例的代理
+          const renderContext = new Proxy(instance, {
+            get(t, k, r) {
+              // 取得组件自身状态与props数据
+              const { state, props } = t;
+              // 先尝试读取自身状态数据
+              if (state && k in state) {
+                return state[k];
+              } else if (props && k in props) {
+                // 如果组件自身没有该数据，则尝试从props 中读取
+                return props[k];
+              } else {
+                new Error("不存在");
+              }
+            },
+            set(t, k, v, r) {
+              const { state, props } = t;
+              if (state && k in state) {
+                state[k] = v;
+              } else if (props && k in props) {
+                console.warn(
+                  `Attempting to mutate prop "${k}". Props are readonly.`
+                );
+              } else {
+                new Error("不存在");
+              }
+            },
+          });
+
+          // 在这里调用 created 钩子
+          created && created.call(renderContext);
+          // 将组件的 render 函数调用包装到 effect 内
+          effect(
+            () => {
+              // 执行渲染函数，获取组件要渲染的内容，即 render 函数返回的虚拟 DOM
+              const subTree = render.call(renderContext, renderContext);
+              if (!instance.isMounted) {
+                // 在这里调用 beforeMount 钩子
+                beforMount && beforMount.call(renderContext);
+                // 初次挂载，调用patch函数，第一个参数传递null
+                patch(null, subTree, container, anchor);
+                // 重点，将组建实例的isMounted置为true，这样当更新时就不会再次进行挂载操作，
+                // 而是会执行更新
+                instance.isMounted = true;
+                // 在这里调用 mounted 钩子
+                mounted && mounted.call(renderContext);
+              } else {
+                // 在这里调用 beforeUpdate 钩子
+                beforeUpdate && beforeUpdate.call(renderContext);
+                patch(instance.subTree, subTree, container, anchor);
+                // 在这里调用 updated 钩子
+                updated && updated.call(renderContext);
+              }
+              instance.subTree = subTree;
+            },
+            {
+              // 指定该副作用函数的调度器为 queueJob 即可
+              scheduler: queueJob,
+            }
+          );
+        }
+        // 更新组件
+        function patchComponent(n1, n2, anchor) {
+          const instance = (n2.component = n1.component);
+          const { props } = instance;
+          if (hasPropsChanged(n1.props, n2.props)) {
+            // 调用 resolveProps 函数重新获取 props 数据
+            const [nextProps] = resolveProps(n2.type.props, n2.props);
+            // 更新 props
+            for (const k in nextProps) {
+              props[k] = nextProps[k];
+            }
+            // 删除不存在的props
+            for (const k in props) {
+              if (!(k in nextProps)) delete props[k];
+            }
+          }
+        }
+        function hasPropsChanged(prevProps, nextProps) {
+          const nextKeys = Object.keys(nextProps);
+          if (nextKeys.length !== Object.keys(prevProps)) {
+            return true;
+          }
+          for (let i = 0; i < nextKeys.length; i++) {
+            const key = nextKeys[i];
+            if (nextProps[key] !== prevProps[key]) return true;
+          }
+          return false;
+        }
+        function patch(n1, n2, container, anchor) {
+          // 我们优先检查新旧 vnode 所描述的内容是否相同，如果不同，则直接调用 unmount
+          // 函数将旧 vnode 卸载。
+          if (n1 && n1.type !== n2.type) {
+            //  如果新旧 vnode 的类型不同，则直接将旧 vnode 卸载
+            unmount(n1);
+            // 卸载完成后，我们应该将参数 n1 的值重置为 null，这样才能保证后续挂载操作正确执行
+            n1 = null;
+          }
+          const { type } = n2;
+          if (typeof type === "string") {
+            // 如果 n1 不存在，意味着挂载，则调用 mountElement 函数完成挂载
+            if (!n1) {
+              mountElement(n2, container, anchor);
+            } else {
+              // n1 存在，意味着打补丁，暂时省略
+              patchElement(n1, n2);
+            }
+          } else if (type === Text) {
+            // 如果新 vnode 的类型是 Text，则说明该 vnode 描述的是文本节点
+            if (!n1) {
+              // 使用 createTextNode 创建文本节点
+              // const el = n2.el = document.createTextNode(n2.children)
+              const el = (n2.el = createText(n2.children));
+              // 将文本节点插入到容器中
+              insert(el, container);
+            } else {
+              // 如果旧 vnode 存在，只需要使用新文本节点的文本内容更新旧文本节点即
+              const el = (n2.el = n1.el);
+              if (n2.children !== n1.children) {
+                setText(el, n2.children);
+                // el.nodeValue = n2.children
+              }
+            }
+          } else if (typeof type === "object") {
+            // vnode.type 的值是选项对象，作为组件来处理
+            if (!n1) {
+              mountComponent(n2, container, anchor);
+            } else {
+              // n1 存在，意味着打补丁，暂时省略
+              patchComponent(n1, n2, anchor);
+            }
+          } else if (type === "xxx") {
+          }
+        }
+        function unmount(vnode) {
+          // 获取 el 的父元素
+          const parent = vnode.el.parentNode;
+          // 调用 removeChild 移除元素
+          if (parent) parent.removeChild(vnode.el);
+        }
+        function render(vnode, container) {
+          if (vnode) {
+            // 新 vnode 存在，将其与旧 vnode 一起传递给 patch 函数，进行打补
+            patch(container._vnode, vnode, container);
+          } else {
+            if (container._vnode) {
+              // 旧 vnode 存在，且新 vnode 不存在，说明是卸载（unmount）操作
+              // 根据 vnode 获取要卸载的真实 DOM 元素
+              unmount(container._vnode);
+            }
+          }
+          // 把 vnode 存储到 container._vnode 下，即后续渲染中的旧 vnode
+          container._vnode = vnode;
+        }
+        return {
+          render,
+        };
+      }
+
+      // const vnode = {
+      //   type: "h1",
+      //   children: "hello world!!",
+      // };
+      // const renderer = createRenderer({
+      //   createElement(tag) {
+      //     console.log(`创建元素 ${tag}`);
+      //     return { tag };
+      //   },
+      //   setElementText(el, text) {
+      //     console.log(el, 4545);
+      //     console.log(`设置 ${JSON.stringify(el)} 的文本内容：${text}`);
+      //     el.textContent = text;
+      //   },
+      //   insert(el, parent, anchor = null) {
+      //     console.log(
+      //       `将 ${JSON.stringify(el)} 添加到${JSON.stringify(parent)} 下`
+      //     );
+      //     parent.children = el;
+      //   },
+      // });
+      // renderer.render(vnode, document.querySelector("#app"));
+      // debugger;
+      const renderer = createRenderer({
+        createElement(tag) {
+          return document.createElement(tag);
+        },
+        setElementText(el, text) {
+          el.textContent = text;
+        },
+        insert(el, parent, anchor = null) {
+          parent.insertBefore(el, anchor);
+        },
+        createText(text) {
+          return document.createTextNode(text);
+        },
+        setText(el, text) {
+          el.nodeValue = text;
+        },
+        patchProps(el, key, prevValue, nextValue) {
+          // 匹配以 on 开头的属性，视其为事件
+          if (/^on/.test(key)) {
+            // 根据属性名称得到对应的事件名称，例如 onClick ---> click
+            const name = key.slice(2).toLowerCase();
+            const invokers = el._vei || (el._vei = {});
+            let invoker = invokers[key];
+            if (nextValue) {
+              if (!invoker) {
+                invoker = el._vei[key] = (e) => {
+                  // e.timeStamp 是事件发生的时间
+                  // 如果事件发生的时间早于事件处理函数绑定的时间，则不执行事件处理函数
+                  if (e.timeStamp < invoker.attached) return;
+                  // 如果 invoker.value 是数组，则遍历它并逐个调用事件处理函数
+                  if (Array.isArray(invoker.value)) {
+                    invoker.value.forEach((fn) => fn(e));
+                  } else {
+                    // 否则直接作为函数调用
+                    invoker.value(e);
+                  }
+                };
+                // 将真正的事件处理函数赋值给 invoker.value
+                invoker.value = nextValue;
+                // 添加 invoker.attached 属性，存储事件处理函数被绑定的时间
+                invoker.attached = performance.now();
+                el.addEventListener(name, invoker);
+              } else {
+                // 如果 invoker 存在，意味着更新，并且只需要更新 invoker.value的值即可
+                invoker.value = nextValue;
+              }
+            } else if (invoker) {
+              // 新的事件绑定函数不存在，且之前绑定的 invoker 存在，则移除绑定
+              el.removeEventListener(name, invoker);
+            }
+          }
+          // 对 class 进行特殊处理
+          else if (key === "class") {
+            el.className = nextValue || "";
+          }
+          // 用 in 操作符判断 key 是否存在对应的 DOM Properties
+          // 使用 shouldSetAsProps 函数判断是否应该作为 DOM Properties设置
+          else if (shouldSetAsProps(el, key, nextValue)) {
+            // 获取该 DOM Properties 的类型
+            const type = typeof el[key];
+            // 如果是布尔类型，并且 value 是空字符串，则将值矫正为 true
+            if (type === "boolean" && nextValue === "") {
+              el[key] = true;
+            } else {
+              el[key] = nextValue;
+            }
+          } else {
+            // 如果要设置的属性没有对应的 DOM Properties，则使用setAttribute 函数设置属性
+            // 调用 setAttribute 将属性设置到元素上
+            el.setAttribute(key, nextValue);
+          }
+        },
+      });
+
+      // const node = {
+      //   type: "div",
+      //   props: {
+      //     class: "testdiv",
+      //     id: "testdiv",
+      //   },
+
+      //   children: [
+      //     {
+      //       type: "input",
+      //       children: "input",
+      //       props: {
+      //         id: "ipt",
+      //         // form: "form",
+      //         class: "ipt",
+      //         disabled: true,
+      //         value: "hello world!!",
+      //       },
+      //     },
+      //   ],
+      // };
+      // renderer.render(node, document.querySelector("#app"));
+
+      // const bol = ref(false);
+      // function testClick() {
+      //   console.log(45)
+      //   debugger
+      //   bol.value = true
+
+      // }
+
+      // effect(() => {
+      //   const vnode = {
+      //     type: "div",
+      //     props: bol.value
+      //       ? {
+      //           onClick: () => {
+      //             alert("父元素 clicked");
+      //           },
+      //           id: "parent"
+      //         }
+      //       : {},
+      //     children: [
+      //       {
+      //         type: "p",
+      //         props: {
+      //           onClick: testClick,
+      //           id:"child"
+      //         },
+      //         children: "text",
+      //       },
+      //     ],
+      //   };
+      //   // 渲染 vnode
+      //   renderer.render(vnode, document.querySelector("#app"));
+      // });
+
+      // const oldVNode = {
+      //   type: "div",
+      //   children: [
+      //     { type: "p", children: "1", key: 1, props: { class: "p-1" } },
+      //     { type: "p", children: "2", key: 2, props: { class: "p-2" } },
+      //     { type: "p", children: "hello", key: 3, props: { class: "p-3" } },
+      //     { type: "p", children: "mam", key: 4, props: { class: "p-4" } },
+      //   ],
+      // };
+
+      // const newVNode = {
+      //   type: "div",
+      //   children: [
+      //     { type: "p", children: "1", key: 1, props: { class: "p-1" } },
+      //     { type: "p", children: "world", key: 3, props: { class: "p-3" } },
+      //     { type: "p", children: "5", key: 5, props: { class: "p-5" } },
+      //     // { type: "p", children: "6", key: 6, props: { class: "p-6" } },
+      //     { type: "p", children: "2", key: 2, props: { class: "p-2" } },
+
+      //     { type: "p", children: "dad", key: 4, props: { class: "p-4" } },
+      //   ],
+      // };
+      // // 首次挂载
+      // renderer.render(oldVNode, document.querySelector("#app"));
+      // setTimeout(() => {
+      //   debugger;
+      //   // 1 秒钟后更新
+      //   renderer.render(newVNode, document.querySelector("#app"));
+      // }, 1000);
+
+      // 组件的渲染
+
+      // const MyComponent = {
+      //   name: "MyComponent",
+      //   props: {
+      //     title: String,
+      //   },
+      //   data() {
+      //     return {
+      //       foo: "hello world!",
+      //     };
+      //   },
+      //   render() {
+      //     return {
+      //       type: "div",
+      //       children: `foo的值是: ${this.foo}`,
+      //     };
+      //   },
+      // };
+      // const CompVNode = {
+      //   type: MyComponent,
+      //   props: {
+      //     title: "A big Title",
+      //     others: "others"
+      //   }
+      // };
+      // renderer.render(CompVNode, document.querySelector("#app"));
+
+      const ParentComponent = {
+        name: "ParentComponent",
+        props: {
+          foo: String,
+        },
+        data() {
+          return {
+            title: "你好呀",
+          };
+        },
+        render() {
+          return {
+            type: "div",
+            children: `我是foo：${this.foo}\r\n\r\n我是title: ${this.title}`,
+          };
+        },
+      };
+      const PVnode = {
+        type: ParentComponent,
+        props: {
+          foo: "hello world!",
+        },
+      };
+      renderer.render(PVnode, document.querySelector("#app"));
+    </script>
+  </body>
+</html>
