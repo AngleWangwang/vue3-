@@ -11,7 +11,7 @@
       let activeEffect;
       const effectStack = [];
       let effect = function (fn, options = {}) {
-        // debugger;
+        // 测试一段代码提交
         const effectFn = () => {
           activeEffect = effectFn;
           cleanup(effectFn);
